@@ -67,17 +67,15 @@ async function comRetrySimples(funcaoChamada, tentativasRestantes = totalChaves(
   } catch (erro) {
     const mensagem = erro?.message || "";
     const eLimiteDeRequisicoes = mensagem.includes("429") || mensagem.includes("RESOURCE_EXHAUSTED");
-    const eSobrecarga = mensagem.includes("503") || mensagem.includes("UNAVAILABLE");
 
-    if ((eLimiteDeRequisicoes || eSobrecarga) && tentativasRestantes > 0) {
-      if (eLimiteDeRequisicoes && totalChaves() > 1) {
+    if (eLimiteDeRequisicoes && tentativasRestantes > 0) {
+      if (totalChaves() > 1) {
         ai = avancarChave();
-      } else {
-        // Sobrecarga temporária do modelo (não é problema da sua cota) — só espera um pouco e tenta de novo.
-        const espera = 5000;
-        console.log(`⏳ Modelo sobrecarregado, aguardando ${espera / 1000}s para tentar de novo...`);
-        await new Promise((resolve) => setTimeout(resolve, espera));
+        return comRetrySimples(funcaoChamada, tentativasRestantes - 1);
       }
+      const match = mensagem.match(/retryDelay":"(\d+(?:\.\d+)?)s/);
+      const segundosEspera = match ? Math.ceil(parseFloat(match[1])) + 1 : 15;
+      await new Promise((resolve) => setTimeout(resolve, segundosEspera * 1000));
       return comRetrySimples(funcaoChamada, tentativasRestantes - 1);
     }
     throw erro;

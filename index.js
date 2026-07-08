@@ -1,64 +1,35 @@
 import "dotenv/config";
-import { GoogleGenAI } from "@google/genai";
 import readline from "readline";
 import { getDefinicoesFerramentas, getExecutorPorNome } from "./registro_bots.js";
 import { getSystemPromptPersonalidade } from "./personalidade.js";
 import { carregarMemoria, atualizarMemoriaComTroca } from "./memoria.js";
 import { iniciarAgendador } from "./agendador.js";
 import { enviarMensagemProativa } from "./canal_saida.js";
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const MODELO = "gemini-2.5-flash-lite"; // maior limite de requisições/min no tier gratuito
-
-// Tenta de novo automaticamente se bater no limite de requisições (erro 429),
-// esperando o tempo que a própria API pede antes de tentar de novo.
-async function comRetry(funcaoChamada, tentativasRestantes = 3) {
-  try {
-    return await funcaoChamada();
-  } catch (erro) {
-    const mensagem = erro?.message || "";
-    const eLimiteDeRequisicoes = mensagem.includes("429") || mensagem.includes("RESOURCE_EXHAUSTED");
-
-    if (eLimiteDeRequisicoes && tentativasRestantes > 0) {
-      const match = mensagem.match(/retryDelay":"(\d+(?:\.\d+)?)s/);
-      const segundosEspera = match ? Math.ceil(parseFloat(match[1])) + 1 : 15;
-
-      console.log(`⏳ Limite de requisições atingido, aguardando ${segundosEspera}s para tentar de novo...`);
-      await new Promise((resolve) => setTimeout(resolve, segundosEspera * 1000));
-
-      return comRetry(funcaoChamada, tentativasRestantes - 1);
-    }
-
-    throw erro;
-  }
-}
+import { gerarRespostaComFallback, nomesProvedoresAtivos } from "./gerenciador_provedores.js";
 
 // Em modo CLI, tratamos como um único usuário. Se conectar no WhatsApp,
 // troque isso pelo número da pessoa (ex: req.body.From no webhook da Twilio),
 // assim cada pessoa tem sua própria memória.
 const USUARIO_ID = process.env.USUARIO_ID || "usuario_padrao";
 
-// Os bots são definidos no formato { name, description, input_schema }.
-// O Gemini espera "parameters" em vez de "input_schema" — convertemos aqui.
 const definicoesBots = getDefinicoesFerramentas();
-const ferramentasGemini =
-  definicoesBots.length > 0
-    ? [
-        {
-          functionDeclarations: definicoesBots.map((b) => ({
-            name: b.name,
-            description: b.description,
-            parameters: b.input_schema,
-          })),
-        },
-      ]
-    : undefined;
 
 if (definicoesBots.length === 0) {
   console.log(
     "⚠️  Nenhum bot registrado ainda. Copie bots/_template_bot.js, crie o seu, " +
       "e registre ele em registro_bots.js para o orquestrador poder usá-lo.\n"
   );
+}
+
+console.log(`🔌 Provedores de IA ativos (em ordem de prioridade): ${nomesProvedoresAtivos().join(" → ") || "nenhum!"}\n`);
+
+// Ponte entre o nome de uma ferramenta chamada pelo modelo e o bot de verdade.
+async function executarBot(nomeBot, args) {
+  const executor = getExecutorPorNome(nomeBot);
+  if (!executor) {
+    return { erro: `Bot "${nomeBot}" não encontrado.` };
+  }
+  return executor(args);
 }
 
 function montarSystemPrompt(memoria) {
@@ -75,96 +46,38 @@ function montarSystemPrompt(memoria) {
   ].join("\n");
 }
 
-async function chamarGemini(historico, systemPrompt) {
-  return comRetry(() =>
-    ai.models.generateContent({
-      model: MODELO,
-      contents: historico,
-      config: {
-        systemInstruction: systemPrompt,
-        ...(ferramentasGemini ? { tools: ferramentasGemini } : {}),
-      },
-    })
-  );
-}
-
+// historico aqui é uma lista simples: [{ role: "user" | "assistant", texto: "..." }]
+// Cada provedor converte isso pro formato dele por baixo dos panos.
 async function processarMensagem(historico, systemPrompt) {
-  let resposta = await chamarGemini(historico, systemPrompt);
-  let parts = resposta.candidates[0].content.parts || [];
+  const respostaTexto = await gerarRespostaComFallback({
+    mensagensSimples: historico,
+    systemPrompt,
+    ferramentas: definicoesBots,
+    executor: executarBot,
+  });
 
-  while (parts.some((p) => p.functionCall)) {
-    historico.push({ role: "model", parts });
-
-    const respostasFuncoes = [];
-
-    for (const parte of parts) {
-      if (!parte.functionCall) continue;
-
-      const { name, args } = parte.functionCall;
-      console.log(`\n🔧 Chamando: ${name}(${JSON.stringify(args)})`);
-
-      const executor = getExecutorPorNome(name);
-      let resultado;
-
-      if (!executor) {
-        resultado = { erro: `Bot "${name}" não encontrado.` };
-      } else {
-        try {
-          resultado = await executor(args);
-        } catch (erro) {
-          resultado = { erro: `Erro ao executar ${name}: ${erro.message}` };
-        }
-      }
-
-      console.log(`✅ Resultado de ${name}:`, resultado);
-
-      respostasFuncoes.push({
-        functionResponse: { name, response: resultado },
-      });
-    }
-
-    historico.push({ role: "function", parts: respostasFuncoes });
-
-    resposta = await chamarGemini(historico, systemPrompt);
-    parts = resposta.candidates[0].content.parts || [];
-  }
-
-  const textoFinal = parts
-    .filter((p) => p.text)
-    .map((p) => p.text)
-    .join("\n");
-
-  historico.push({ role: "model", parts });
-
-  return textoFinal;
+  historico.push({ role: "assistant", texto: respostaTexto });
+  return respostaTexto;
 }
 
 // Usado pelo agendador para o bot gerar uma mensagem sozinho, sem pergunta prévia da pessoa.
+// Tem acesso aos mesmos bots/ferramentas da conversa normal (ex: pode pesquisar na web
+// antes de decidir se vale a pena falar com você).
 async function gerarMensagemProativa(motivo) {
   const memoria = carregarMemoria(USUARIO_ID);
   const systemPrompt = montarSystemPrompt(memoria);
 
-  const resposta = await comRetry(() =>
-    ai.models.generateContent({
-      model: MODELO,
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: `[SISTEMA INTERNO — a pessoa não disse nada agora, você está tomando a iniciativa de falar com ela] Motivo: ${motivo}`,
-            },
-          ],
-        },
-      ],
-      config: { systemInstruction: systemPrompt },
-    })
-  );
-
-  return resposta.candidates[0].content.parts
-    .filter((p) => p.text)
-    .map((p) => p.text)
-    .join("\n");
+  return gerarRespostaComFallback({
+    mensagensSimples: [
+      {
+        role: "user",
+        texto: `[SISTEMA INTERNO — a pessoa não disse nada agora, você está tomando a iniciativa de falar com ela] Motivo: ${motivo}`,
+      },
+    ],
+    systemPrompt,
+    ferramentas: definicoesBots,
+    executor: executarBot,
+  });
 }
 
 // --- Interface de linha de comando para testar ---
@@ -190,7 +103,8 @@ function perguntar() {
     const memoria = carregarMemoria(USUARIO_ID);
     const systemPrompt = montarSystemPrompt(memoria);
 
-    historico.push({ role: "user", parts: [{ text: mensagem }] });
+    historico.push({ role: "user", texto: mensagem });
+    process.stdout.write("💭 pensando...\r");
 
     try {
       const respostaFinal = await processarMensagem(historico, systemPrompt);

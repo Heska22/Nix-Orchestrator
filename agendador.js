@@ -14,20 +14,31 @@ export function iniciarAgendador({ gerarMensagemProativa, enviarMensagemProativa
   });
 
   // 2) Verificação periódica — o bot decide sozinho se vale a pena avisar algo.
-  // Por padrão roda a cada 30 minutos, mas está vazio: você define a regra real.
-  cron.schedule("*/30 * * * *", async () => {
-    // Exemplos do que você pode colocar aqui:
-    // - Rodar o bot_pesquisa_web sobre um assunto que a pessoa acompanha,
-    //   e só disparar mensagem se encontrar algo novo/importante.
-    // - Checar o resultado de uma tarefa longa que outro bot estava rodando.
-    // - Verificar se algum prazo/lembrete está próximo.
-    //
-    // const algoRelevante = await suaLogicaDeVerificacao();
-    // if (algoRelevante) {
-    //   const mensagem = await gerarMensagemProativa(`Avisar a pessoa sobre: ${algoRelevante}`);
-    //   await enviarMensagemProativa(usuarioId, mensagem);
-    // }
-  });
+  // Configure um tema em TEMA_MONITORAMENTO no .env (ex: "preço do bitcoin", "notícias sobre IA").
+  // Se não configurar nada, essa verificação fica inativa (não gasta requisições à toa).
+  const tema = process.env.TEMA_MONITORAMENTO;
+  const intervaloVerificacao = process.env.INTERVALO_VERIFICACAO || "*/30 * * * *";
+
+  if (tema) {
+    cron.schedule(intervaloVerificacao, async () => {
+      console.log(`🔎 Verificando se há algo relevante sobre "${tema}"...`);
+
+      const mensagem = await gerarMensagemProativa(
+        `Verifique (pesquisando na web se necessário) se há algo novo e realmente relevante sobre "${tema}" ` +
+          `que valha a pena avisar a pessoa agora. Se não achar nada novo ou importante o suficiente, responda ` +
+          `EXATAMENTE com a palavra ATENCAO_NADA_RELEVANTE e mais nada. Se achar algo que valha a pena, escreva ` +
+          `a mensagem para avisar a pessoa diretamente, no seu estilo.`
+      );
+
+      if (!mensagem.includes("ATENCAO_NADA_RELEVANTE")) {
+        await enviarMensagemProativa(usuarioId, mensagem);
+      } else {
+        console.log("🔎 Nada relevante encontrado dessa vez.");
+      }
+    });
+
+    console.log(`🔎 Monitoramento ativo sobre "${tema}" a cada intervalo "${intervaloVerificacao}".`);
+  }
 
   console.log(`⏰ Agendador iniciado — bom dia programado para "${horarioBomDia}" (formato cron).`);
 }
